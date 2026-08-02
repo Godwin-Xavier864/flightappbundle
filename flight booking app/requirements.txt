@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+python-jose
+passlib
+sqlalchemy
+redis
+celery

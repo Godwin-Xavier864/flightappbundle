@@ -1,0 +1,271 @@
+Frontend Build Documentation
+============================
+
+Project type
+------------
+Build the frontend as a single-page app. A good simple choice is React with Vite, because the backend CORS currently allows http://localhost:5173.
+
+Recommended frontend screens
+----------------------------
+1. Signup screen
+   - Form fields: username, email, password.
+   - Call POST /signup.
+   - Show success message or username-exists message.
+
+2. Login screen
+   - Form fields: username, password.
+   - Call POST /login.
+   - Store access_token in localStorage or app state.
+   - Send this token for protected endpoints:
+     Authorization: Bearer <access_token>
+
+3. Destination search screen
+   - Search inputs:
+     - From city
+     - To city
+   - Call GET /flights?from={fromCity}&to={toCity}.
+   - Show loading, error, and empty states.
+   - Save the full response in state because itinerary generation needs it.
+
+4. Results screen
+   Show these sections from GET /flights/{city}:
+   - Destination name
+   - Airport
+   - Weather:
+     - temperature
+     - humidity
+     - wind_speed
+   - 3-day weather forecast:
+     - date
+     - temperature_max
+     - temperature_min
+     - precipitation_sum
+     - wind_speed_max
+   - Flights:
+     - flight_number
+     - airline
+     - from / to
+     - departure_iata / arrival_iata
+     - departure_time / arrival_time
+     - status
+     - distance_km
+     - ticket_price.economy
+     - ticket_price.business
+     - price_difference.business_extra
+     - seat_availability.economy
+     - seat_availability.business
+   - Places:
+     - tourist_spots
+     - hotels
+     - restaurants
+
+5. Booking UI
+   - Each flight card should have:
+     - class selector: economy or business
+     - number of seats input
+     - Buy Ticket button
+   - Before calling the backend, generate an idempotency key on the frontend.
+     Example: crypto.randomUUID()
+   - Call POST /book-ticket.
+   - Include:
+     {
+       "flight_instance_id": "...",
+       "flight_number": "...",
+       "departure_time": "...",
+       "travel_class": "economy",
+       "seats": 1,
+       "idempotency_key": "frontend-generated-uuid"
+     }
+   - On success:
+     - show booking_id
+     - show amount
+     - show remaining seats
+     - use payment_session to show the dummy payment UI
+   - If the user retries the same request, reuse the same idempotency key so seats are not decremented twice.
+
+6. Create itinerary UI
+   - Add a Create Itinerary button after destination search results are loaded.
+   - When clicked, call POST /create-itinerary.
+   - Send the currently loaded details:
+     {
+       "destination": response.destination,
+       "airport": response.airport,
+       "weather": response.weather,
+       "flights": response.flights,
+       "places": response.places,
+       "days": 3
+     }
+   - Show loading while the LLM generates the itinerary.
+   - Display:
+     - provider: gemini, groq, or local_fallback
+     - fallback_from if present
+     - itinerary text
+     - errors if provider is local_fallback
+
+Backend API endpoints
+---------------------
+POST /signup
+Body:
+{
+  "username": "demo",
+  "email": "demo@example.com",
+  "password": "password"
+}
+
+POST /login
+Body:
+{
+  "username": "demo",
+  "password": "password"
+}
+Response:
+{
+  "access_token": "...",
+  "token_type": "bearer"
+}
+
+GET /flights?from={fromCity}&to={toCity}
+Requires Authorization header.
+Returns destination, airport, weather, flights, and places.
+Also returns weather_forecast for the current day and next two days.
+Searches flights from the departure city to the destination city using dep_iata and arr_iata.
+This endpoint may use Aviationstack for live flights and falls back to local airport data when flight API data is unavailable.
+It also includes OpenStreetMap places data.
+Identical route searches are cached in Redis for 300 seconds by default. Cache hits still refresh seat availability from Redis before returning.
+Each flight item includes flight_instance_id. Use that id for booking, reservations, payment, and SSE.
+
+GET /flights/{city}
+Requires Authorization header.
+Legacy destination-only search. Prefer GET /flights?from={fromCity}&to={toCity} for correct route-based flight results.
+Legacy destination-only searches are also cached in Redis.
+
+POST /book-ticket
+Requires Authorization header.
+Body:
+{
+  "flight_instance_id": "AI101:a1b2c3d4e5f6",
+  "flight_number": "FB101",
+  "departure_time": "2026-07-17T10:30",
+  "travel_class": "economy",
+  "seats": 2,
+  "idempotency_key": "uuid-from-frontend"
+}
+Behavior:
+- Validates class and seat count.
+- Checks visible Redis availability, which is DB availability minus active Redis reservations.
+- Reserves seats in Redis with a TTL before payment.
+- Returns an existing booking if the same idempotency key is submitted again.
+- Creates a dummy payment session.
+- Creates the booking as pending. DB seat counts are decremented only after payment success.
+
+POST /payment-result
+Requires Authorization header.
+Body:
+{
+  "idempotency_key": "uuid-from-frontend",
+  "action": "complete"
+}
+Behavior:
+- action=complete runs the dummy payment attempt.
+- Dummy payment randomly succeeds or fails. Set DUMMY_PAYMENT_SUCCESS_RATE to control success probability. Default is 0.8.
+- On dummy success, the booking is confirmed and the DB seat count is decremented.
+- On dummy failure, the booking is marked payment_failed and the Redis reservation is released.
+- action=cancel marks the booking payment_failed and releases the Redis reservation immediately.
+- If the user closes the tab and sends no callback, the Redis reservation TTL expires and Celery marks the pending booking expired.
+- If the Redis reservation TTL expired before payment completion, the booking is marked expired and the user must book again.
+
+GET /my-tickets
+Requires Authorization header.
+Returns the current user's bought tickets that are not expired. Confirmed and refunded tickets are included.
+
+POST /my-tickets/{booking_id}/refund
+Requires Authorization header.
+Body:
+{
+  "reason": "Trip cancelled"
+}
+Behavior:
+- Only the owner of the ticket can request a refund.
+- Only confirmed tickets can request a refund.
+- Creates a pending refund request for admin review.
+- Does not release seats until an admin approves the refund.
+
+Admin refund endpoints are documented separately in admin_endpoints.md.
+
+Redis/Celery seat cache
+-----------------------
+- Redis stores fast flight seat snapshots and active reservation holds.
+- Redis also caches frequently accessed flight search responses.
+- Reservation TTL defaults to 900 seconds and can be changed with RESERVATION_TTL_SECONDS.
+- Flight search cache TTL defaults to 300 seconds and can be changed with FLIGHT_SEARCH_CACHE_TTL_SECONDS.
+- Redis URL defaults to redis://localhost:6379/0 and can be changed with REDIS_URL.
+- Celery syncs Redis from DB every 60 seconds, expires stale pending bookings, and rebuilds missing Redis holds from non-expired pending bookings.
+- FastAPI also rebuilds active pending reservation holds on startup so the system does not wait for the next Celery tick after a Redis/API restart.
+- Rebuilt holds preserve the original reservation window. If a booking expires in 6 minutes, Redis is restored with a 6 minute TTL, not a fresh reservation TTL.
+- Run worker: celery -A celery_app.celery_app worker --loglevel=info
+- Run scheduler: celery -A celery_app.celery_app beat --loglevel=info
+
+SSE seat updates
+----------------
+GET /flight-instances/{flight_instance_id}/seat-events
+Requires Authorization header.
+Behavior:
+- Subscribes the client to only that exact flight instance's Redis pub/sub channel.
+- Sends the current seat availability immediately.
+- Pushes seat_update events when seats are reserved, released, or confirmed.
+- A user watching AI101 at 2026-07-17T10:30 will not receive updates for AI101 at a different departure time.
+- Redis seat keys include the flight instance and store departure_time with the cached seat data.
+
+POST /create-itinerary
+Requires Authorization header.
+Body:
+{
+  "destination": "Mumbai",
+  "airport": "Chhatrapati Shivaji International Airport",
+  "weather": {},
+  "flights": [],
+  "places": {},
+  "days": 3
+}
+Behavior:
+- Uses Gemini first.
+- Falls back to Groq if Gemini fails.
+- Falls back to a local itinerary if both LLM providers fail.
+
+Frontend state structure
+------------------------
+Keep these states:
+- authToken
+- currentUser
+- destinationSearch
+- tripResults
+- selectedFlight
+- selectedClass
+- selectedSeats
+- bookingStatus
+- itineraryStatus
+- itineraryResult
+- errorMessage
+
+Error handling to show in frontend
+----------------------------------
+- 401: user is not logged in or token expired.
+- 404 city not found: show a friendly city-not-found message.
+- 400 booking errors: show exact backend message, such as seats unavailable.
+- 503 service unavailable: show retry message.
+- places.status == "unavailable": still show flights/weather and hide or mark places as unavailable.
+- itinerary provider == "local_fallback": show itinerary, but mark it as generated without LLM.
+
+Important implementation notes
+------------------------------
+- Do not call protected endpoints without Authorization header.
+- Generate idempotency keys on the frontend for booking requests.
+- Reuse the same idempotency key while retrying the same booking.
+- Generate a new idempotency key for a different booking attempt.
+- Keep the full /flights?from={fromCity}&to={toCity} response in state so it can be sent to /create-itinerary.
+- The backend CORS currently allows http://localhost:5173, so run Vite on port 5173.
+- Never expose secret API keys in frontend code. Gemini, Groq, and Aviationstack keys must stay in backend .env.
+
+Suggested UI flow
+-----------------
+Login -> Search destination -> View weather/flights/places -> Book flight or Create itinerary -> Show booking/payment details and itinerary.
