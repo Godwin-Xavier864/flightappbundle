@@ -3,7 +3,7 @@ import random
 import uuid
 
 
-DUMMY_PAYMENT_SUCCESS_RATE = float(os.getenv("DUMMY_PAYMENT_SUCCESS_RATE", "0.8"))
+DUMMY_PAYMENT_SUCCESS_RATE = float(os.getenv("DUMMY_PAYMENT_SUCCESS_RATE", "1.0"))
 
 
 def new_payment_order_id():

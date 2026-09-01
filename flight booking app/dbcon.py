@@ -56,8 +56,7 @@ class WeatherHistory(Base):
     
     
     
-    
-    
+
 class Airport(Base):
     __tablename__ = "airports"
 
@@ -80,6 +79,8 @@ class FlightSeat(Base):
     flight_instance_id = Column(String(120), unique=True, index=True)
     flight_number = Column(String(20), index=True)
     departure_time = Column(String(40), index=True)
+    from_city = Column(String(100))
+    to_city = Column(String(100))
     economy_available = Column(Integer, default=120)
     business_available = Column(Integer, default=20)
     economy_price = Column(Integer)
@@ -93,6 +94,8 @@ class Booking(Base):
     flight_instance_id = Column(String(120), index=True)
     flight_number = Column(String(20), index=True)
     departure_time = Column(String(40), index=True)
+    from_city = Column(String(100))
+    to_city = Column(String(100))
     travel_class = Column(String(20))
     seats = Column(Integer)
     amount = Column(Integer)
@@ -107,6 +110,20 @@ class Booking(Base):
     refund_resolved_at = Column(DateTime)
 
     user_id = Column(String(36), ForeignKey("users.id"))
+
+
+class FlightInteraction(Base):
+    __tablename__ = "flight_interactions"
+
+    id = Column(String(36), primary_key=True, default=new_uuid, index=True)
+    user_id = Column(String(36), ForeignKey("users.id"), index=True)
+    flight_instance_id = Column(String(120), index=True)
+    flight_number = Column(String(20), index=True)
+    event_type = Column(String(30), index=True)
+    route_from = Column(String(10), index=True)
+    route_to = Column(String(10), index=True)
+    weight = Column(Float, default=1.0)
+    created_at = Column(DateTime)
 
 
 def add_column_if_missing(table_name, column_name, column_sql):
@@ -457,3 +474,5 @@ replace_unique_index_with_non_unique("ix_flight_seats_flight_number", "flight_se
 add_index_if_missing("idx_flight_seats_instance", "flight_seats", "flight_instance_id", unique=True)
 add_index_if_missing("idx_flight_seats_number_departure", "flight_seats", "flight_number, departure_time")
 add_index_if_missing("idx_bookings_instance_class_status", "bookings", "flight_instance_id, travel_class, status")
+add_index_if_missing("idx_flight_interactions_user_event", "flight_interactions", "user_id, event_type")
+add_index_if_missing("idx_flight_interactions_instance", "flight_interactions", "flight_instance_id")

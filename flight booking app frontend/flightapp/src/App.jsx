@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, useRef } from 'react'
 import { SERVER_URL } from './constants'
 import './App.css'
 
@@ -41,6 +41,116 @@ function App() {
   const [itineraryResult, setItineraryResult] = useState(null)
   const [errorMessage, setErrorMessage] = useState('')
   const [isSearching, setIsSearching] = useState(false)
+  const [agentMessages, setAgentMessages] = useState([
+    {
+      id: 'welcome',
+      role: 'agent',
+      content: 'Hello! I am SkyNav AI, your intelligent flight concierge. Where would you like to fly today? Type something like "Book a flight from New York to London for 1 seat in economy".',
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    },
+  ])
+  const [agentInput, setAgentInput] = useState('')
+  const [isAgentLoading, setIsAgentLoading] = useState(false)
+  const [agentBookingStatus, setAgentBookingStatus] = useState({})
+
+  async function sendAgentMessage(userText) {
+    const text = (typeof userText === 'string' ? userText : agentInput).trim()
+    if (!text || isAgentLoading) return
+
+    const userMsg = {
+      id: Date.now().toString(),
+      role: 'user',
+      content: text,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    }
+
+    setAgentMessages((prev) => [...prev, userMsg])
+    setAgentInput('')
+    setIsAgentLoading(true)
+
+    const history = agentMessages
+      .filter((m) => m.role === 'user' || m.role === 'agent')
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+      }))
+
+    try {
+      const data = await request('/agent/chat', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          message: text,
+          chat_history: history,
+        }),
+      })
+
+      const agentMsg = {
+        id: (Date.now() + 1).toString(),
+        role: 'agent',
+        content: data.response || 'I have processed your request.',
+        pending_booking: data.pending_booking,
+        search_results: data.search_results,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      }
+
+      setAgentMessages((prev) => [...prev, agentMsg])
+      if (data.pending_booking) {
+        await loadTickets()
+      }
+    } catch (error) {
+      const errorMsg = {
+        id: (Date.now() + 1).toString(),
+        role: 'agent',
+        content: `Error: ${error.message || 'Failed to connect to AI Agent.'}`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      }
+      setAgentMessages((prev) => [...prev, errorMsg])
+    } finally {
+      setIsAgentLoading(false)
+    }
+  }
+
+  async function confirmAgentPayment(pendingBooking, action = 'complete') {
+    const idempotencyKey = pendingBooking.payment_session?.idempotency_key || pendingBooking.idempotency_key
+    const bookingId = pendingBooking.booking_id
+
+    if (!idempotencyKey) return
+
+    setAgentBookingStatus((prev) => ({
+      ...prev,
+      [bookingId]: { status: 'processing', action },
+    }))
+
+    try {
+      const data = await request('/payment-result', {
+        method: 'POST',
+        headers: authHeaders,
+        body: JSON.stringify({
+          idempotency_key: idempotencyKey,
+          action,
+        }),
+      })
+
+      setAgentBookingStatus((prev) => ({
+        ...prev,
+        [bookingId]: {
+          status: action === 'complete' ? 'confirmed' : 'cancelled',
+          data,
+          message: action === 'complete' ? 'Payment Confirmed & Ticket Issued!' : 'Booking hold cancelled.',
+        },
+      }))
+      await loadTickets()
+    } catch (error) {
+      setAgentBookingStatus((prev) => ({
+        ...prev,
+        [bookingId]: {
+          status: 'error',
+          message: error.message || 'Payment confirmation failed.',
+        },
+      }))
+    }
+  }
 
   const isLoggedIn = Boolean(authToken)
   const forecast = tripResults?.weather_forecast || tripResults?.forecast || []
@@ -184,7 +294,13 @@ async function handleAuth(event) {
 
     try {
       const data = await request('/my-tickets', { headers: authHeaders })
-      setTickets(Array.isArray(data) ? data : data?.tickets || data?.items || [])
+      const rawList = Array.isArray(data) ? data : data?.tickets || data?.items || []
+      const sorted = [...rawList].sort((a, b) => {
+        const idA = Number(a.booking_id || a.id || 0)
+        const idB = Number(b.booking_id || b.id || 0)
+        return idB - idA
+      })
+      setTickets(sorted)
       setTicketsStatus('success')
     } catch (error) {
       setTicketsError(error.message)
@@ -462,6 +578,13 @@ async function handleAuth(event) {
           Search flights
         </button>
         <button
+          className={activePage === 'agent' ? 'active' : ''}
+          type="button"
+          onClick={() => setActivePage('agent')}
+        >
+          🤖 SkyNav AI Assistant
+        </button>
+        <button
           className={activePage === 'tickets' ? 'active' : ''}
           type="button"
           onClick={openTicketsPage}
@@ -516,6 +639,17 @@ async function handleAuth(event) {
               />
             )}
           </section>
+        ) : activePage === 'agent' ? (
+          <AgentChatView
+            agentMessages={agentMessages}
+            agentInput={agentInput}
+            setAgentInput={setAgentInput}
+            isAgentLoading={isAgentLoading}
+            onSendMessage={sendAgentMessage}
+            agentBookingStatus={agentBookingStatus}
+            onConfirmPayment={confirmAgentPayment}
+            openTicketsPage={openTicketsPage}
+          />
         ) : (
           <TicketsPage
             onRefresh={loadTickets}
@@ -733,6 +867,13 @@ function TripResults({
   onPaymentResult,
   onCreateItinerary,
 }) {
+  const recommendedFlight = tripResults.flights?.find(
+    (flight) => flight.recommendation?.is_recommended
+  )
+  const listedFlights = recommendedFlight && tripResults.flights.length > 1
+    ? tripResults.flights.filter((flight) => getFlightKey(flight) !== getFlightKey(recommendedFlight))
+    : tripResults.flights
+
   return (
     <div className="results-grid">
       <section className="panel summary-panel">
@@ -769,20 +910,30 @@ function TripResults({
           <h2>Flights</h2>
         </div>
         {tripResults.flights?.length ? (
-          <div className="flight-list">
-            {tripResults.flights.map((flight) => (
-              <FlightCard
-                bookingForm={bookingForms[getFlightKey(flight)] || initialBookingForm}
-                bookingStatus={bookingStatus[getFlightKey(flight)]}
-                flight={flight}
-                key={getFlightKey(flight)}
-                seatAvailability={seatSnapshots[flight.flight_instance_id]}
+          <>
+            {recommendedFlight && (
+              <RecommendedFlightSpotlight
+                bookingStatus={bookingStatus[getFlightKey(recommendedFlight)]}
+                flight={recommendedFlight}
                 onBook={onBook}
                 onPaymentResult={onPaymentResult}
-                updateBookingForm={updateBookingForm}
               />
-            ))}
-          </div>
+            )}
+            <div className="flight-list">
+              {listedFlights.map((flight) => (
+                <FlightCard
+                  bookingForm={bookingForms[getFlightKey(flight)] || initialBookingForm}
+                  bookingStatus={bookingStatus[getFlightKey(flight)]}
+                  flight={flight}
+                  key={getFlightKey(flight)}
+                  seatAvailability={seatSnapshots[flight.flight_instance_id]}
+                  onBook={onBook}
+                  onPaymentResult={onPaymentResult}
+                  updateBookingForm={updateBookingForm}
+                />
+              ))}
+            </div>
+          </>
         ) : (
           <p className="empty-state">No flights were returned for this destination.</p>
         )}
@@ -817,6 +968,52 @@ function TripResults({
           <p className="empty-state">Generate a 3-day plan from the loaded destination details.</p>
         )}
       </section>
+    </div>
+  )
+}
+
+function RecommendedFlightSpotlight({ bookingStatus, flight, onBook, onPaymentResult }) {
+  return (
+    <div className="recommended-flight-spotlight">
+      <div className="recommended-flight-summary">
+        <div className="recommendation-orbit" aria-hidden="true">
+          <span />
+        </div>
+        <div className="recommended-flight-copy">
+          <p className="eyebrow">Recommended for you</p>
+          <h3>{flight.flight_number}</h3>
+          <p>{flight.airline || 'Airline'} - {flight.from} to {flight.to}</p>
+          <span>{flight.recommendation?.reason || 'Best overall match'}</span>
+        </div>
+        <div className="recommended-flight-meta">
+          <strong>{formatMoney(flight.ticket_price?.economy)}</strong>
+          <span>{flight.departure_iata} {formatDateTime(flight.departure_time)}</span>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={() => onBook(flight)}
+            disabled={
+              bookingStatus?.type === 'loading' ||
+              bookingStatus?.type === 'pending_payment' ||
+              bookingStatus?.type === 'payment_processing'
+            }
+          >
+            {bookingStatus?.type === 'loading' ? 'Reserving...' : 'Buy ticket'}
+          </button>
+        </div>
+      </div>
+      {bookingStatus?.type === 'loading' && <p className="notice">Reserving seats...</p>}
+      {bookingStatus?.type === 'pending_payment' && (
+        <PaymentSession
+          data={bookingStatus.data}
+          flight={flight}
+          onPaymentResult={onPaymentResult}
+        />
+      )}
+      {bookingStatus?.type === 'payment_processing' && <p className="notice">Completing payment...</p>}
+      {bookingStatus?.type === 'canceling' && <p className="notice">Canceling payment...</p>}
+      {bookingStatus?.type === 'error' && <p className="notice error">{bookingStatus.message}</p>}
+      {bookingStatus?.type === 'success' && <BookingReceipt data={bookingStatus.data} />}
     </div>
   )
 }
@@ -860,8 +1057,17 @@ function FlightCard({
           <h3>{flight.flight_number}</h3>
           <p>{flight.from} to {flight.to}</p>
         </div>
-        <span className="status-pill">{flight.status || 'status unavailable'}</span>
+        <div className="flight-badges">
+          {flight.recommendation?.is_recommended && (
+            <span className="recommendation-pill">Recommended</span>
+          )}
+          <span className="status-pill">{flight.status || 'status unavailable'}</span>
+        </div>
       </div>
+
+      {flight.recommendation?.is_recommended && (
+        <p className="notice">{flight.recommendation.reason}</p>
+      )}
 
       <div className="flight-details">
         <span>{flight.departure_iata} {formatDateTime(flight.departure_time)}</span>
@@ -969,6 +1175,14 @@ function TicketsPage({
   onRefund,
   onRefresh,
 }) {
+  const sortedTickets = useMemo(() => {
+    return [...tickets].sort((a, b) => {
+      const idA = Number(getBookingId(a) || a.booking_id || a.id || 0)
+      const idB = Number(getBookingId(b) || b.booking_id || b.id || 0)
+      return idB - idA
+    })
+  }, [tickets])
+
   return (
     <section className="tickets-page">
       <div className="section-heading">
@@ -988,7 +1202,7 @@ function TicketsPage({
       )}
 
       <div className="ticket-list">
-        {tickets.map((ticket) => {
+        {sortedTickets.map((ticket) => {
           const bookingId = getBookingId(ticket)
           const status = getBookingStatus(ticket)
           const canRefund = String(status).toLowerCase() === 'confirmed'
@@ -1458,6 +1672,177 @@ function createIdempotencyKey() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID()
 
   return `booking-${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
+function AgentChatView({
+  agentMessages,
+  agentInput,
+  setAgentInput,
+  isAgentLoading,
+  onSendMessage,
+  agentBookingStatus,
+  onConfirmPayment,
+  openTicketsPage,
+}) {
+  const chatEndRef = useRef(null)
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [agentMessages, isAgentLoading])
+
+  const promptChips = [
+    'Book a flight from New York to London for 1 seat in economy',
+    'Find flights from Paris to Tokyo',
+    'Recommend best flight from Los Angeles to Chicago',
+  ]
+
+  return (
+    <section className="panel agent-chat-container">
+      <div className="agent-header">
+        <div className="agent-badge">
+          <span className="agent-avatar">🤖</span>
+          <div>
+            <h3>SkyNav AI Assistant</h3>
+            <p className="agent-subtitle">Powered by SkyNav Intelligent Agent Engine</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="agent-messages-list">
+        {agentMessages.map((msg) => (
+          <div key={msg.id} className={`agent-message-item ${msg.role}`}>
+            <div className="message-bubble">
+              <p className="message-content">{msg.content}</p>
+
+              {msg.pending_booking && (
+                <AgentPaymentConfirmationCard
+                  pendingBooking={msg.pending_booking}
+                  statusObj={agentBookingStatus[msg.pending_booking.booking_id]}
+                  onConfirmPayment={onConfirmPayment}
+                  openTicketsPage={openTicketsPage}
+                />
+              )}
+
+              <span className="message-time">{msg.timestamp}</span>
+            </div>
+          </div>
+        ))}
+
+        {isAgentLoading && (
+          <div className="agent-message-item agent">
+            <div className="message-bubble loading-bubble">
+              <span className="typing-dot"></span>
+              <span className="typing-dot"></span>
+              <span className="typing-dot"></span>
+              <span className="loading-text">Agent is searching & planning...</span>
+            </div>
+          </div>
+        )}
+        <div ref={chatEndRef} />
+      </div>
+
+      <div className="agent-prompt-chips">
+        {promptChips.map((chip, idx) => (
+          <button
+            key={idx}
+            type="button"
+            className="chip-button"
+            onClick={() => onSendMessage(chip)}
+            disabled={isAgentLoading}
+          >
+            {chip}
+          </button>
+        ))}
+      </div>
+
+      <form
+        className="agent-input-bar"
+        onSubmit={(e) => {
+          e.preventDefault()
+          onSendMessage()
+        }}
+      >
+        <input
+          type="text"
+          placeholder="Ask AI agent to search or book a flight..."
+          value={agentInput}
+          onChange={(e) => setAgentInput(e.target.value)}
+          disabled={isAgentLoading}
+        />
+        <button className="primary-button" type="submit" disabled={isAgentLoading || !agentInput.trim()}>
+          {isAgentLoading ? 'Sending...' : 'Send'}
+        </button>
+      </form>
+    </section>
+  )
+}
+
+function AgentPaymentConfirmationCard({ pendingBooking, statusObj, onConfirmPayment, openTicketsPage }) {
+  const bookingId = pendingBooking.booking_id
+  const currentStatus = statusObj?.status || 'pending'
+
+  return (
+    <div className="payment-confirmation-card">
+      <div className="card-header">
+        <h4>💳 Flight Reservation (Payment Required)</h4>
+        <span className={`status-badge ${currentStatus}`}>
+          {currentStatus === 'confirmed'
+            ? 'CONFIRMED'
+            : currentStatus === 'cancelled'
+            ? 'CANCELLED'
+            : 'ACTION REQUIRED'}
+        </span>
+      </div>
+
+      <div className="card-body grid-details">
+        <div><strong>Flight:</strong> {pendingBooking.flight_number || pendingBooking.flight_instance_id}</div>
+        <div><strong>Class:</strong> {pendingBooking.travel_class?.toUpperCase()}</div>
+        <div><strong>Seats:</strong> {pendingBooking.seats_reserved || pendingBooking.seats} seat(s)</div>
+        <div><strong>Total Price:</strong> ₹{pendingBooking.amount}</div>
+        {pendingBooking.reservation_expires_at && (
+          <div className="expiry-note">
+            ⏱️ Hold expires: {new Date(pendingBooking.reservation_expires_at).toLocaleTimeString()}
+          </div>
+        )}
+      </div>
+
+      {currentStatus === 'confirmed' ? (
+        <div className="payment-success-banner">
+          <p>✅ Payment confirmed! Your ticket is active.</p>
+          <button type="button" className="ghost-button" onClick={openTicketsPage}>
+            View My Tickets →
+          </button>
+        </div>
+      ) : currentStatus === 'cancelled' ? (
+        <div className="payment-cancel-banner">
+          <p>Seat reservation cancelled.</p>
+        </div>
+      ) : (
+        <div className="card-actions">
+          <button
+            type="button"
+            className="primary-button pay-button"
+            disabled={currentStatus === 'processing'}
+            onClick={() => onConfirmPayment(pendingBooking, 'complete')}
+          >
+            {currentStatus === 'processing' ? 'Processing Payment...' : `Confirm & Pay ₹${pendingBooking.amount}`}
+          </button>
+          <button
+            type="button"
+            className="ghost-button cancel-button"
+            disabled={currentStatus === 'processing'}
+            onClick={() => onConfirmPayment(pendingBooking, 'cancel')}
+          >
+            Cancel Hold
+          </button>
+        </div>
+      )}
+
+      {statusObj?.message && currentStatus === 'error' && (
+        <p className="notice error small-notice">{statusObj.message}</p>
+      )}
+    </div>
+  )
 }
 
 export default App

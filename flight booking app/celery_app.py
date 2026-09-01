@@ -23,5 +23,10 @@ celery_app.conf.beat_schedule = {
         "options": {"queue": "flight_booking"},
         "schedule": 60.0,
     },
+    "train-flight-recommender-every-10-minutes": {
+        "task": "celery_tasks.train_flight_recommender",
+        "options": {"queue": "flight_booking"},
+        "schedule": 600.0,
+    },
 }
 celery_app.conf.timezone = "UTC"

@@ -6,3 +6,9 @@ passlib
 sqlalchemy
 redis
 celery
+implicit
+numpy
+langchain
+langgraph
+langchain-groq
+langchain-google-genai

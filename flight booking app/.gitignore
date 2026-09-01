@@ -132,6 +132,9 @@ __pypackages__/
 celerybeat-schedule
 celerybeat.pid
 
+# ML model artifacts
+models/
+
 # Redis
 *.rdb
 *.aof

@@ -12,6 +12,7 @@ from payment_service import (
     run_dummy_payment,
 )
 from itinerary_service import generate_itinerary
+from recommender_service import rank_flights_for_user
 
 from fastapi import FastAPI
 import dbcon
@@ -34,8 +35,10 @@ from schema import (
     PaymentResult,
     RefundRequest,
     AdminRefundDecision,
+    AgentChatRequest,
 )
-import random,math
+import random, math
+from agent_service import run_flight_agent
 app= FastAPI()
 setup_middleware(app)
 
@@ -126,7 +129,45 @@ def get_current_admin(current_user: dbcon.User = Depends(get_current_user)):
     return current_user
 
 
-def serialize_ticket(booking):
+def resolve_ticket_route(db, booking):
+    if getattr(booking, "from_city", None) and getattr(booking, "to_city", None):
+        return booking.from_city, booking.to_city
+
+    flight_num = booking.flight_number or ""
+    flight_inst = booking.flight_instance_id or ""
+
+    dep_city, arr_city = None, None
+    if db:
+        if len(flight_num) >= 8 and flight_num[:2].isalpha():
+            dep_code = flight_num[2:5].upper()
+            arr_code = flight_num[5:8].upper()
+            dep_apt = db.query(dbcon.Airport).filter(dbcon.Airport.iata_code == dep_code).first()
+            arr_apt = db.query(dbcon.Airport).filter(dbcon.Airport.iata_code == arr_code).first()
+            if dep_apt: dep_city = dep_apt.city or dep_apt.airport_name
+            if arr_apt: arr_city = arr_apt.city or arr_apt.airport_name
+
+        if not dep_city or not arr_city:
+            parts = flight_inst.split("-")
+            if len(parts) >= 2:
+                dep_code = parts[0].upper()
+                arr_code = parts[1].upper()
+                dep_apt = db.query(dbcon.Airport).filter(dbcon.Airport.iata_code == dep_code).first()
+                arr_apt = db.query(dbcon.Airport).filter(dbcon.Airport.iata_code == arr_code).first()
+                if dep_apt: dep_city = dep_apt.city or dep_apt.airport_name or parts[0].title()
+                if arr_apt: arr_city = arr_apt.city or arr_apt.airport_name or parts[1].title()
+
+    return dep_city or "Origin", arr_city or "Destination"
+
+
+def serialize_ticket(booking, db=None):
+    from_city = getattr(booking, "from_city", None)
+    to_city = getattr(booking, "to_city", None)
+
+    if not from_city or not to_city:
+        from_c, to_c = resolve_ticket_route(db, booking)
+        from_city = from_city or from_c
+        to_city = to_city or to_c
+
     return {
         "booking_id": booking.id,
         "flight_instance_id": booking.flight_instance_id,
@@ -136,6 +177,8 @@ def serialize_ticket(booking):
         "seats": booking.seats,
         "amount": booking.amount,
         "status": booking.status,
+        "from": from_city or "Origin",
+        "to": to_city or "Destination",
         "payment_order_id": booking.payment_order_id,
         "idempotency_key": booking.idempotency_key,
         "reservation_expires_at": (
@@ -392,6 +435,37 @@ def booking_response(existing_booking, idempotency_key):
         "amount": existing_booking.amount,
         "payment_session": payment_session
     }
+
+
+def log_flight_interaction(db, current_user, flight, event_type, weight):
+    interaction = dbcon.FlightInteraction(
+        user_id=current_user.id,
+        flight_instance_id=flight.get("flight_instance_id"),
+        flight_number=flight.get("flight_number"),
+        event_type=event_type,
+        route_from=flight.get("departure_iata"),
+        route_to=flight.get("arrival_iata"),
+        weight=weight,
+        created_at=datetime.utcnow()
+    )
+    db.add(interaction)
+
+
+def log_search_impressions(current_user, flights):
+    db = dbcon.SESSION_LOCAL()
+    try:
+        for flight in flights:
+            if flight.get("flight_instance_id"):
+                log_flight_interaction(
+                    db,
+                    current_user,
+                    flight,
+                    "search_impression",
+                    0.3
+                )
+        db.commit()
+    finally:
+        db.close()
 
 
 def fetch_json(url):
@@ -699,25 +773,45 @@ def build_route_fallback_flight(from_city, to_city, departure_airport, arrival_a
         arrival_airport.latitude,
         arrival_airport.longitude
     )
-    ticket_price = simulate_price(distance)
+    route_code = f"{departure_airport.iata_code}{arrival_airport.iata_code}"
+    airlines = [
+        "Fallback Airways",
+        "SkyConnect",
+        "AeroLink",
+        "JetRoute",
+        "CloudLine"
+    ]
+    departures = [
+        ("06:15", "08:05"),
+        ("09:40", "11:30"),
+        ("13:20", "15:10"),
+        ("17:45", "19:35"),
+        ("21:10", "23:00")
+    ]
+    price_multipliers = [0.96, 1.02, 1.08, 0.99, 1.12]
+    base_price = simulate_price(distance)
+    flights = []
 
-    flight = {
-        "flight_number": f"FB{departure_airport.iata_code}{arrival_airport.iata_code}",
-        "airline": "Fallback Airways",
-        "from": departure_airport.airport_name,
-        "to": arrival_airport.airport_name,
-        "from_city": from_city.title(),
-        "to_city": to_city.title(),
-        "departure_iata": departure_airport.iata_code,
-        "arrival_iata": arrival_airport.iata_code,
-        "distance_km": round(distance, 2),
-        "departure_time": "estimated",
-        "arrival_time": None,
-        "status": "estimated",
-        "source": "local_route_fallback"
-    }
+    for index, (departure_time, arrival_time) in enumerate(departures, start=1):
+        ticket_price = round(base_price * price_multipliers[index - 1])
+        flight = {
+            "flight_number": f"FB{route_code}{index}",
+            "airline": airlines[index - 1],
+            "from": departure_airport.airport_name,
+            "to": arrival_airport.airport_name,
+            "from_city": from_city.title(),
+            "to_city": to_city.title(),
+            "departure_iata": departure_airport.iata_code,
+            "arrival_iata": arrival_airport.iata_code,
+            "distance_km": round(distance, 2),
+            "departure_time": departure_time,
+            "arrival_time": arrival_time,
+            "status": "estimated",
+            "source": "local_route_fallback"
+        }
+        flights.append(add_booking_options(flight, ticket_price))
 
-    return [add_booking_options(flight, ticket_price)]
+    return flights
 
 
 def build_fallback_flights(departure_airport):
@@ -842,6 +936,16 @@ async def book_ticket(
         )
 
         db.add(booking)
+        log_flight_interaction(
+            db,
+            current_user,
+            {
+                "flight_instance_id": seat_record.flight_instance_id,
+                "flight_number": seat_record.flight_number,
+            },
+            "booking_started",
+            2.0
+        )
         try:
             db.commit()
         except IntegrityError:
@@ -1021,6 +1125,16 @@ async def payment_result(
             )
 
         booking.status = "confirmed"
+        log_flight_interaction(
+            db,
+            current_user,
+            {
+                "flight_instance_id": booking.flight_instance_id,
+                "flight_number": booking.flight_number,
+            },
+            "booking_confirmed",
+            5.0
+        )
         db.commit()
         redis_seats.release_hold(payment.idempotency_key, return_seats=False)
 
@@ -1094,7 +1208,7 @@ async def my_tickets(current_user: dbcon.User = Depends(get_current_user)):
     try:
         tickets = db.query(dbcon.Booking).filter(
             dbcon.Booking.user_id == current_user.id,
-            dbcon.Booking.status.in_(["confirmed", "refunded"])
+            dbcon.Booking.status.in_(["confirmed", "pending", "refunded", "payment_failed", "expired"])
         ).order_by(dbcon.Booking.id.desc()).all()
 
         return {
@@ -1293,14 +1407,24 @@ async def search_route_flights(
         cached_response = None
 
     if cached_response:
-        return refresh_cached_seat_availability(cached_response)
+        cached_response = refresh_cached_seat_availability(cached_response)
+        cached_response["flights"] = rank_flights_for_user(
+            current_user,
+            cached_response.get("flights", [])
+        )
+        return cached_response
 
     try:
         cache_lock_acquired = redis_seats.acquire_flight_search_lock(from_city, to_city)
         if not cache_lock_acquired:
             cached_response = await wait_for_flight_search_cache(from_city, to_city)
             if cached_response:
-                return refresh_cached_seat_availability(cached_response)
+                cached_response = refresh_cached_seat_availability(cached_response)
+                cached_response["flights"] = rank_flights_for_user(
+                    current_user,
+                    cached_response.get("flights", [])
+                )
+                return cached_response
     except RedisError:
         cache_lock_acquired = False
 
@@ -1413,15 +1537,29 @@ async def search_route_flights(
 
             db.close()
 
-    if not flights:
+    if len(flights) < 5:
         local_departure = find_local_airport(from_city)
         local_arrival = find_local_airport(to_city)
-        flights = build_route_fallback_flight(
+        fallback_flights = build_route_fallback_flight(
             from_city,
             to_city,
             local_departure,
             local_arrival
         )
+        existing_instances = {
+            flight.get("flight_instance_id")
+            for flight in flights
+        }
+        for fallback_flight in fallback_flights:
+            if fallback_flight.get("flight_instance_id") in existing_instances:
+                continue
+            flights.append(fallback_flight)
+            existing_instances.add(fallback_flight.get("flight_instance_id"))
+            if len(flights) == 5:
+                break
+
+    flights = rank_flights_for_user(current_user, flights)
+    log_search_impressions(current_user, flights)
 
     db = dbcon.SESSION_LOCAL()
     history = dbcon.WeatherHistory(
@@ -1734,3 +1872,215 @@ async def search_flights(
             pass
 
     return response_payload
+
+
+def run_search_sync(from_city: str, to_city: str, current_user: dbcon.User):
+    try:
+        cached_response = redis_seats.get_cached_flight_search(from_city, to_city)
+    except RedisError:
+        cached_response = None
+
+    if cached_response:
+        cached_response = refresh_cached_seat_availability(cached_response)
+        cached_response["flights"] = rank_flights_for_user(
+            current_user,
+            cached_response.get("flights", [])
+        )
+        return cached_response
+
+    departure_airport_info = find_airport_for_location(from_city)
+    arrival_airport_info = find_airport_for_location(to_city)
+    weather_location = arrival_airport_info["city"] or to_city
+    latitude = arrival_airport_info["latitude"]
+    longitude = arrival_airport_info["longitude"]
+
+    if latitude is None or longitude is None:
+        geo_url = (
+            f"https://geocoding-api.open-meteo.com/v1/search"
+            f"?name={weather_location}&count=1"
+        )
+        geo = fetch_json(geo_url)
+        if geo and "results" in geo and geo["results"]:
+            location = geo["results"][0]
+            latitude = location["latitude"]
+            longitude = location["longitude"]
+
+    places = fetch_destination_places(latitude, longitude) if (latitude and longitude) else {"status": "unavailable"}
+
+    weather = None
+    if latitude and longitude:
+        weather_url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={latitude}"
+            f"&longitude={longitude}"
+            f"&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
+            f"&daily=temperature_2m_max,temperature_2m_min,precipitation_sum,wind_speed_10m_max"
+            f"&forecast_days=3"
+        )
+        weather = fetch_json(weather_url)
+
+    current = (weather or {}).get("current", {"temperature_2m": 22.0, "relative_humidity_2m": 50, "wind_speed_10m": 10.0})
+    weather_forecast = format_weather_forecast(weather) if weather else []
+
+    local_departure = find_local_airport(from_city)
+    local_arrival = find_local_airport(to_city)
+    flights = build_route_fallback_flight(
+        from_city,
+        to_city,
+        local_departure,
+        local_arrival
+    )
+
+    flights = rank_flights_for_user(current_user, flights)
+
+    response_payload = {
+        "from": from_city.title(),
+        "destination": to_city.title(),
+        "departure_airport": departure_airport_info.get("name", from_city.title()),
+        "arrival_airport": arrival_airport_info.get("name", to_city.title()),
+        "weather": {
+            "temperature": current.get("temperature_2m", 22),
+            "humidity": current.get("relative_humidity_2m", 50),
+            "wind_speed": current.get("wind_speed_10m", 10)
+        },
+        "weather_forecast": weather_forecast,
+        "flights": flights,
+        "places": places,
+    }
+
+    try:
+        redis_seats.set_cached_flight_search(
+            from_city,
+            to_city,
+            flight_cache_payload(response_payload)
+        )
+    except RedisError:
+        pass
+
+    return response_payload
+
+
+def run_book_sync(data: dict, current_user: dbcon.User):
+    flight_instance_id = data["flight_instance_id"]
+    travel_class = normalize_travel_class(data.get("travel_class", "economy"))
+    seats = int(data.get("seats", 1))
+    idempotency_key = data.get("idempotency_key") or str(uuid.uuid4())
+    departure_time = data.get("departure_time")
+
+    if seats < 1:
+        raise HTTPException(status_code=400, detail="seats must be at least 1")
+
+    db = dbcon.SESSION_LOCAL()
+    try:
+        seat_record = db.query(dbcon.FlightSeat).filter(
+            dbcon.FlightSeat.flight_instance_id == flight_instance_id
+        ).first()
+
+        if not seat_record:
+            flight_num = flight_instance_id.split("-")[0] if "-" in flight_instance_id else "FL-101"
+            simulated_econ = simulate_price(1200)
+            simulated_biz = round(simulated_econ * CLASS_MULTIPLIERS.get("business", 1.8))
+            seat_record = dbcon.FlightSeat(
+                flight_instance_id=flight_instance_id,
+                flight_number=flight_num,
+                departure_time=departure_time or datetime.utcnow().isoformat(),
+                economy_total=160,
+                economy_available=160,
+                economy_price=float(simulated_econ),
+                business_total=30,
+                business_available=30,
+                business_price=float(simulated_biz),
+                first_total=10,
+                first_available=10,
+                first_price=float(simulated_biz * 1.5)
+            )
+            db.add(seat_record)
+            db.commit()
+            db.refresh(seat_record)
+
+        price_field = f"{travel_class}_price"
+        price = getattr(seat_record, price_field) or simulate_price(1000)
+
+        try:
+            reserved, remaining_seats, expires_at = redis_seats.reserve_seats(
+                seat_record,
+                travel_class,
+                seats,
+                idempotency_key
+            )
+        except RedisError:
+            # Fallback if redis unavailable
+            expires_at = int(datetime.utcnow().timestamp()) + 600
+            reserved = True
+            remaining_seats = getattr(seat_record, f"{travel_class}_available") - seats
+
+        if not reserved:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only {remaining_seats} {travel_class} seats available"
+            )
+
+        amount = price * seats
+        order_id = new_payment_order_id()
+        reservation_expires_at = datetime.utcfromtimestamp(expires_at)
+
+        from_city = data.get("from_city") or getattr(seat_record, "from_city", None)
+        to_city = data.get("to_city") or getattr(seat_record, "to_city", None)
+
+        if not from_city or not to_city:
+            from_c, to_c = resolve_ticket_route(db, seat_record)
+            from_city = from_city or from_c
+            to_city = to_city or to_c
+
+        booking = dbcon.Booking(
+            flight_instance_id=seat_record.flight_instance_id,
+            flight_number=seat_record.flight_number,
+            departure_time=seat_record.departure_time or departure_time or datetime.utcnow().isoformat(),
+            from_city=from_city,
+            to_city=to_city,
+            travel_class=travel_class,
+            seats=seats,
+            amount=amount,
+            payment_order_id=order_id,
+            idempotency_key=idempotency_key,
+            status="pending",
+            reservation_expires_at=reservation_expires_at,
+            user_id=current_user.id
+        )
+
+        db.add(booking)
+        db.commit()
+        db.refresh(booking)
+
+        payment_session = create_dummy_payment_session(amount, booking, idempotency_key)
+
+        return {
+            "message": "Seats reserved. Complete payment before the reservation expires.",
+            "booking_id": booking.id,
+            "flight_instance_id": booking.flight_instance_id,
+            "flight_number": booking.flight_number,
+            "departure_time": booking.departure_time,
+            "travel_class": travel_class,
+            "seats_reserved": seats,
+            "status": booking.status,
+            "reservation_expires_at": reservation_expires_at.isoformat(),
+            "amount": amount,
+            "payment_session": payment_session
+        }
+    finally:
+        db.close()
+
+
+@app.post("/agent/chat")
+def agent_chat_endpoint(
+    req: AgentChatRequest,
+    current_user: dbcon.User = Depends(get_current_user)
+):
+    result = run_flight_agent(
+        user_message=req.message,
+        current_user=current_user,
+        search_fn=run_search_sync,
+        book_fn=run_book_sync,
+        chat_history=req.chat_history
+    )
+    return result

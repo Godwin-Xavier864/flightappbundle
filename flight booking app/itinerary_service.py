@@ -111,21 +111,22 @@ def generate_itinerary(details):
     prompt = build_itinerary_prompt(details)
     errors = {}
 
-    itinerary, error = call_gemini(prompt)
-    if itinerary:
-        return {
-            "provider": "gemini",
-            "itinerary": itinerary
-        }
-    errors["gemini"] = error
-
     itinerary, error = call_groq(prompt)
     if itinerary:
         return {
             "provider": "groq",
-            "itinerary": itinerary,
-            "fallback_from": "gemini"
+            "itinerary": itinerary
         }
     errors["groq"] = error
 
+    itinerary, error = call_gemini(prompt)
+    if itinerary:
+        return {
+            "provider": "gemini",
+            "itinerary": itinerary,
+            "fallback_from": "groq"
+        }
+    errors["gemini"] = error
+
     return local_itinerary_fallback(details, errors)
+

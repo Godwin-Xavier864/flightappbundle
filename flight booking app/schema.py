@@ -43,3 +43,8 @@ class CreateItinerary(BaseModel):
     flights: list[dict] = []
     places: dict | None = None
     days: int = 3
+
+
+class AgentChatRequest(BaseModel):
+    message: str
+    chat_history: list[dict] = []
